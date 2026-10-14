@@ -22,7 +22,7 @@ from .backends import (
     UpdateEvent,
     UpdateEventData,
 )
-from .client import DisconnectCallback, FitnessMachine
+from .client import DisconnectCallback, FitnessMachine, Protocol
 from .const import FTMS_UUID
 from .errors import NotFitnessMachineError
 from .machines import get_machine
@@ -47,6 +47,7 @@ def get_client(
     timeout: float = 2,
     on_ftms_event: FtmsCallback | None = None,
     on_disconnect: DisconnectCallback | None = None,
+    protocol: Protocol = "auto",
     **kwargs: Any,
 ) -> FitnessMachine:
     """
@@ -59,6 +60,7 @@ def get_client(
     - `timeout` - Control operation timeout. Defaults to 2.0s.
     - `on_ftms_event` - Callback for receiving fitness machine events.
     - `on_disconnect` - Disconnection callback.
+    - `protocol` - Control protocol variant: `auto` (default), `ftms` or `eslinker`. See `Protocol`.
     - `**kwargs` - Additional keyword arguments for backwards compatibility.
 
     Return:
@@ -79,6 +81,7 @@ def get_client(
         timeout=timeout,
         on_ftms_event=on_ftms_event,
         on_disconnect=on_disconnect,
+        protocol=protocol,
         kwargs=kwargs,
     )
 
@@ -139,6 +142,7 @@ async def get_client_from_address(
     timeout: float = 2,
     on_ftms_event: FtmsCallback | None = None,
     on_disconnect: DisconnectCallback | None = None,
+    protocol: Protocol = "auto",
     **kwargs: Any,
 ) -> FitnessMachine:
     """
@@ -150,6 +154,7 @@ async def get_client_from_address(
     - `timeout` - Control operation timeout. Defaults to 2.0s.
     - `on_ftms_event` - Callback for receiving fitness machine events.
     - `on_disconnect` - Disconnection callback.
+    - `protocol` - Control protocol variant: `auto` (default), `ftms` or `eslinker`. See `Protocol`.
     - `**kwargs` - Additional keyword arguments for backwards compatibility.
 
     Return:
@@ -166,6 +171,7 @@ async def get_client_from_address(
                 timeout=timeout,
                 on_ftms_event=on_ftms_event,
                 on_disconnect=on_disconnect,
+                protocol=protocol,
                 kwargs=kwargs,
             )
 
@@ -174,6 +180,7 @@ async def get_client_from_address(
 
 __all__ = [
     "discover_ftms_devices",
+    "Protocol",
     "get_client",
     "get_client_from_address",
     "get_machine_type_from_advertisement",
