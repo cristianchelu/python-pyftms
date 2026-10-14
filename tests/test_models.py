@@ -36,6 +36,17 @@ from pyftms.serializer import BaseModel, ModelSerializer, get_serializer
             b"\x05\x69\x00",
             {"code": 5, "target_speed": 1.05},
         ),
+        # Padded Machine Status from a YIJIAN 42AN treadmill (Start/Resume, Stop)
+        (
+            MachineStatusModel,
+            b"\x04\x00\x00",
+            {"code": 4},
+        ),
+        (
+            MachineStatusModel,
+            b"\x02\x01\x00",
+            {"code": 2, "stop_pause": 1},
+        ),
     ],
 )
 def test_realtime_data(model: type[BaseModel], data: bytes, result: dict):
