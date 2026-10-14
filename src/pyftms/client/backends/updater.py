@@ -24,11 +24,23 @@ class DataUpdater:
         self._serializer = get_serializer(model)
         self._prev: dict[str, Any] = {}
         self._result: dict[str, Any] = {}
+        self._override: dict[str, Any] = {}
 
     def reset(self) -> None:
         """Resetting state. Call while disconnection event."""
         self._prev.clear()
         self._result.clear()
+        self._override.clear()
+
+    def set_override(self, **values: Any) -> None:
+        """
+        Override values reported by the machine.
+
+        For machines whose real-time data stops tracking reality once a vendor
+        channel takes over (e.g. ESLinker speed control). Overridden keys come
+        from the override even when the machine reports them.
+        """
+        self._override.update(values)
 
     async def subscribe(self, cli: BleakClient, uuid: str) -> None:
         """Subscribe for notification."""
@@ -45,6 +57,8 @@ class DataUpdater:
         if data[0] & 1:
             _LOGGER.debug("'More Data' bit is set. Waiting for next data.")
             return
+
+        self._result |= self._override
 
         # My device sends a lot of null packets during wakeup and sleep mode.
         # So I just filter null packets.

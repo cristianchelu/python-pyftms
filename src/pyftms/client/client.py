@@ -7,7 +7,7 @@ import logging
 from abc import ABC
 from functools import cached_property
 from types import MappingProxyType
-from typing import Any, Callable, ClassVar
+from typing import Any, Callable, ClassVar, Literal
 
 from bleak import BleakClient
 from bleak.backends.device import BLEDevice
@@ -24,7 +24,14 @@ from ..models import (
     StopPauseCode,
 )
 from . import const as c
-from .backends import DataUpdater, FtmsCallback, MachineController, UpdateEvent
+from .backends import (
+    DataUpdater,
+    ESLinkerController,
+    FtmsCallback,
+    MachineController,
+    UpdateEvent,
+)
+from .backends.eslinker import ESLINKER_SERVICE_UUID
 from .manager import PropertiesManager
 from .properties import (
     DeviceInfo,
@@ -40,6 +47,15 @@ from .properties.device_info import DIS_UUID
 _LOGGER = logging.getLogger(__name__)
 
 type DisconnectCallback = Callable[[FitnessMachine], None]
+
+type Protocol = Literal["auto", "ftms", "eslinker"]
+"""
+Control protocol variant.
+
+- `auto`: FTMS, plus the ESLinker vendor channel for speed when such a module is detected.
+- `ftms`: FTMS only. On an ESLinker machine Start/Stop work but speed setting does not.
+- `eslinker`: the vendor channel is used for speed regardless of the device name.
+"""
 
 
 class FitnessMachine(ABC, PropertiesManager):
@@ -62,6 +78,9 @@ class FitnessMachine(ABC, PropertiesManager):
 
     _updater: DataUpdater
 
+    _eslinker: ESLinkerController | None = None
+    """Vendor speed controller, set when an ESLinker module is detected."""
+
     _device: BLEDevice
     _need_connect: bool
 
@@ -80,12 +99,14 @@ class FitnessMachine(ABC, PropertiesManager):
         timeout: float = 2.0,
         on_ftms_event: FtmsCallback | None = None,
         on_disconnect: DisconnectCallback | None = None,
+        protocol: Protocol = "auto",
         **kwargs: Any,
     ) -> None:
         super().__init__(on_ftms_event)
 
         self._need_connect = False
         self._timeout = timeout
+        self._protocol = protocol
         self._disconnect_cb = on_disconnect
         self._kwargs = kwargs
 
@@ -201,6 +222,12 @@ class FitnessMachine(ABC, PropertiesManager):
 
         return self._machine_type
 
+    @property
+    def protocol(self) -> Protocol:
+        """Control protocol variant this client was created with."""
+
+        return self._protocol
+
     @cached_property
     def supported_properties(self) -> list[str]:
         """
@@ -246,6 +273,9 @@ class FitnessMachine(ABC, PropertiesManager):
         self._updater.reset()
         self._controller.reset()
 
+        if self._eslinker:
+            self._eslinker.reset()
+
         if self._disconnect_cb:
             self._disconnect_cb(self)
 
@@ -262,8 +292,9 @@ class FitnessMachine(ABC, PropertiesManager):
             device=self._device,
             name=self.name,
             disconnected_callback=self._on_disconnect,
-            # we needed only two services: `Fitness Machine Service` and `Device Information Service`
-            services=[c.FTMS_UUID, DIS_UUID],
+            # `Fitness Machine Service`, `Device Information Service`
+            # and the ESLinker vendor service
+            services=[c.FTMS_UUID, DIS_UUID, ESLINKER_SERVICE_UUID],
             kwargs=self._kwargs,
         )
 
@@ -284,6 +315,41 @@ class FitnessMachine(ABC, PropertiesManager):
         await self._controller.subscribe(self._cli)
         await self._updater.subscribe(self._cli, self._data_uuid)
 
+        if self._eslinker is None and ESLinkerController.supported(
+            self._cli, self.name, force=self._protocol == "eslinker"
+        ) and self._protocol != "ftms":
+            _LOGGER.info(
+                "ESLinker module detected. Target speed is set over the vendor channel."
+            )
+            limits = {}
+
+            if r := self._settings_ranges.get(c.TARGET_SPEED):
+                limits = {"min_speed": r.min_value, "max_speed": r.max_value}
+
+            self._eslinker = ESLinkerController(
+                self._on_event, on_data=self._updater.set_override, **limits
+            )
+
+    async def _eslinker_speed(
+        self, value: float, *, end_session: bool = True
+    ) -> ResultCode:
+        """Set speed through the ESLinker vendor channel."""
+        assert self._eslinker is not None
+
+        if not self._need_connect:
+            return ResultCode.FAILED
+
+        await self._connect()
+
+        return await self._eslinker.set_speed(
+            self._cli, value, end_session=end_session
+        )
+
+    @property
+    def _eslinker_active(self) -> bool:
+        """`True` once the vendor channel owns the machine on this connection."""
+        return self._eslinker is not None and self._eslinker.active
+
     # COMMANDS
 
     async def _write_command(
@@ -303,14 +369,25 @@ class FitnessMachine(ABC, PropertiesManager):
 
     async def start_resume(self) -> ResultCode:
         """Initiate the procedure to start or resume a training session."""
+        if self._eslinker_active:
+            assert self._eslinker is not None
+
+            return await self._eslinker_speed(self._eslinker.min_speed)
+
         return await self._write_command(ControlCode.START_RESUME)
 
     async def stop(self) -> ResultCode:
         """Initiate the procedure to stop a training session."""
+        if self._eslinker_active:
+            return await self._eslinker_speed(0)
+
         return await self._write_command(stop_pause=StopPauseCode.STOP)
 
     async def pause(self) -> ResultCode:
         """Initiate the procedure to pause a training session."""
+        if self._eslinker_active:
+            return await self._eslinker_speed(0, end_session=False)
+
         return await self._write_command(stop_pause=StopPauseCode.PAUSE)
 
     async def set_setting(self, setting_id: str, *args: Any) -> ResultCode:
@@ -328,6 +405,9 @@ class FitnessMachine(ABC, PropertiesManager):
 
         if len(args) == 1:
             args = args[0]
+
+        if setting_id == c.TARGET_SPEED and self._eslinker is not None:
+            return await self._eslinker_speed(float(args))
 
         return await self._write_command(code=None, **{setting_id: args})
 
