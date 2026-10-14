@@ -3,10 +3,13 @@
 
 import dataclasses as dc
 import io
+import logging
 from enum import STRICT, IntEnum, auto
 from typing import Any, cast, override
 
 from ..serializer import BaseModel, ModelMeta, model_meta
+
+_LOGGER = logging.getLogger(__name__)
 
 
 class StopPauseCode(IntEnum, boundary=STRICT):
@@ -110,6 +113,8 @@ class CodeSwitchModel[T: int](BaseModel):
 
             break
 
-        assert not src.read()
+        # Some machines pad notifications (e.g. Machine Status `04 00 00`).
+        if tail := src.read():
+            _LOGGER.debug("Ignoring %d trailing byte(s): %s", len(tail), tail.hex(" "))
 
         return kwargs

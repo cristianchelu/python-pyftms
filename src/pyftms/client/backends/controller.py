@@ -174,27 +174,32 @@ class MachineController:
 
         async with self._write_lock:
             self._indicate = asyncio.Future()
-            _, resp = await asyncio.wait_for(
-                asyncio.gather(
-                    cli.write_gatt_char(
-                        CONTROL_POINT_UUID,
-                        bio.getvalue(),
-                        True,
-                    ),
-                    self._indicate,
-                ),
-                timeout=timeout,
-            )
 
-        bio = io.BytesIO(resp)
+            await cli.write_gatt_char(CONTROL_POINT_UUID, bio.getvalue(), True)
 
-        indicate = ControlIndicateModel._deserialize(bio)
+            try:
+                resp = await asyncio.wait_for(self._indicate, timeout=timeout)
 
-        if indicate.request_code != request.code:
-            raise ValueError("Response on another request?..")
+            except TimeoutError:
+                # Some machines execute commands but never send the Response Code
+                # indication (e.g. YIJIAN treadmills with ESLinker BLE modules).
+                # The write itself was acknowledged, so treat it as accepted.
+                _LOGGER.debug(
+                    "No control point response to %s. Assuming success.",
+                    request.code,
+                )
+                resp = None
 
-        if indicate.result_code != ResultCode.SUCCESS:
-            return indicate.result_code
+        if resp is not None:
+            bio = io.BytesIO(resp)
+
+            indicate = ControlIndicateModel._deserialize(bio)
+
+            if indicate.request_code != request.code:
+                raise ValueError("Response on another request?..")
+
+            if indicate.result_code != ResultCode.SUCCESS:
+                return indicate.result_code
 
         if request.code == ControlCode.RESET:
             self._auth = False
