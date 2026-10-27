@@ -63,6 +63,14 @@ def test_button_event():
     assert button_event(b"\x02\x01\x00") is None
 
 
+FAST_RAMP = dict(ramp_interval=0, ramp_dwell=0)
+
+
+async def _stopped(ctl: ESLinkerController) -> None:
+    if ctl._ramp:
+        await ctl._ramp
+
+
 def _client(name: str = "ESLinker-31B33D", vendor: bool = True) -> MagicMock:
     cli = MagicMock()
     cli.is_connected = True
@@ -104,7 +112,7 @@ def test_set_speed_handshake_and_events():
     async def run():
         events = []
         cli = _client()
-        ctl = ESLinkerController(events.append, keepalive=0.05)
+        ctl = ESLinkerController(events.append, keepalive=0.05, **FAST_RAMP)
 
         assert not ctl.active
         assert await ctl.set_speed(cli, 2.0) == ResultCode.SUCCESS
@@ -124,12 +132,14 @@ def test_set_speed_handshake_and_events():
         tail = [call.args[1] for call in cli.write_gatt_char.call_args_list][6:]
         assert tail and set(tail) == {inclination_frame()}
 
-        # second command: no handshake again, stop event on transition to 0
+        # second command: no handshake again, slows down, stop event on transition to 0
         events.clear()
         await ctl.stop(cli)
-        assert cli.write_gatt_char.call_args_list[-1].args[1] == speed_frame(0)
+        await _stopped(ctl)
+        writes = [c.args[1] for c in cli.write_gatt_char.call_args_list if c.args[1] != inclination_frame()]
+        assert writes[-7:] == [speed_frame(v) for v in (1.8, 1.6, 1.4, 1.2, 1.0, 0.8, 0)]
         assert cli.start_notify.await_count == 1
-        assert [e.event_id for e in events] == ["setup", "update", "stop"]
+        assert [e.event_id for e in events] == ["setup", "update"] * 7 + ["stop"]
 
         ctl.reset()
         assert not ctl.active and ctl.speed == 0
@@ -142,7 +152,10 @@ def test_notify_challenge_and_console_buttons():
         events, speeds = [], []
         cli = _client()
         ctl = ESLinkerController(
-            events.append, on_data=lambda **v: speeds.append(v["speed_instant"]) if "speed_instant" in v else None, keepalive=10
+            events.append,
+            on_data=lambda **v: speeds.append(v["speed_instant"]) if "speed_instant" in v else None,
+            keepalive=10,
+            **FAST_RAMP,
         )
         await ctl.set_speed(cli, 1.5)
         events.clear()
@@ -165,7 +178,7 @@ def test_notify_challenge_and_console_buttons():
         # the console only reports buttons, so we must write the resulting speed
         assert await press(3) == speed_frame(1.6)  # speed up
         assert await press(4) == speed_frame(1.5)  # speed down
-        assert await press(2) == speed_frame(0)  # stop
+        assert await press(2) == speed_frame(0)  # stop, after slowing down
         assert ctl.speed == 0
         assert await press(1) == speed_frame(0.8)  # start: minimum speed, like the app
         n = len(cli.write_gatt_char.call_args_list)
@@ -174,7 +187,7 @@ def test_notify_challenge_and_console_buttons():
 
         assert [e.event_id for e in events if e.event_id in ("start", "stop")] == ["stop", "start"]
         assert all(e.event_source == "user" for e in events if e.event_id in ("start", "stop"))
-        assert speeds == [1.5, 1.6, 1.5, 1.6, 1.5, 0.0, 0.8]
+        assert speeds == [1.5, 1.6, 1.5, 1.6, 1.5, 1.3, 1.1, 0.9, 0.8, 0.0, 0.8]
 
         # speed-reached report, heart rate, fault
         events.clear()
@@ -198,12 +211,13 @@ def test_notify_challenge_and_console_buttons():
 def test_speed_clamped_to_range():
     async def run():
         cli = _client()
-        ctl = ESLinkerController(lambda e: None, min_speed=0.8, max_speed=12.0, keepalive=10)
+        ctl = ESLinkerController(lambda e: None, min_speed=0.8, max_speed=12.0, keepalive=10, **FAST_RAMP)
         await ctl.set_speed(cli, 0.3)
         assert cli.write_gatt_char.call_args_list[-1].args[1] == speed_frame(0.8)
         await ctl.set_speed(cli, 20)
         assert cli.write_gatt_char.call_args_list[-1].args[1] == speed_frame(12.0)
         await ctl.set_speed(cli, 0)
+        await _stopped(ctl)
         assert cli.write_gatt_char.call_args_list[-1].args[1] == speed_frame(0)
 
         # range reported by the machine replaces the defaults
@@ -236,7 +250,7 @@ def test_session_distance_and_time():
     async def run():
         events, data = [], {}
         cli = _client()
-        ctl = ESLinkerController(events.append, on_data=lambda **v: data.update(v), keepalive=10)
+        ctl = ESLinkerController(events.append, on_data=lambda **v: data.update(v), keepalive=10, **FAST_RAMP)
 
         await ctl.set_speed(cli, 3.6)  # 1 m/s
         t0 = ctl._last_tick
@@ -256,11 +270,13 @@ def test_session_distance_and_time():
 
         # pause keeps the session, stop ends it; the next start resets
         await ctl.pause(cli)
+        await _stopped(ctl)
         ctl._tick(ctl._last_tick + 60)
         assert data["distance_total"] == 30 and data["time_elapsed"] == 25
         await ctl.set_speed(cli, 3.6)
         assert data["distance_total"] == 30
         await ctl.stop(cli)
+        await _stopped(ctl)
         assert data["distance_total"] == 30  # final value stays until the next start
         await ctl.set_speed(cli, 3.6)
         assert data["distance_total"] == 0 and data["time_elapsed"] == 0
@@ -269,6 +285,58 @@ def test_session_distance_and_time():
         ctl._on_notify(MagicMock(), bytearray(b"\x05\x01\x02"))
         await asyncio.sleep(0.01)
         assert ctl.speed == 0 and not ctl._session
+
+        ctl.reset()
+
+    asyncio.run(run())
+
+
+def test_stop_slows_down_first():
+    async def run():
+        events = []
+        cli = _client()
+        ctl = ESLinkerController(events.append, keepalive=10, ramp_interval=0.02, ramp_dwell=0.05)
+        frames = lambda: [c.args[1] for c in cli.write_gatt_char.call_args_list]
+
+        await ctl.set_speed(cli, 1.5)
+        n = len(frames())
+
+        # returns at once; the belt steps down to the minimum, waits, then stops
+        await ctl.stop(cli)
+        assert ctl.stopping and ctl._session
+        await ctl.stop(cli)  # pressed again: same slow-down, not a second one
+        await _stopped(ctl)
+        assert frames()[n:] == [speed_frame(v) for v in (1.3, 1.1, 0.9, 0.8, 0)]
+        assert not ctl.stopping and not ctl._session
+        assert [e.event_id for e in events].count("stop") == 1
+
+        # at the minimum already: stops at once
+        await ctl.set_speed(cli, 0.8)
+        await ctl.stop(cli)
+        assert not ctl.stopping and frames()[-1] == speed_frame(0)
+
+        # a pause that turns into a stop ends the session
+        await ctl.set_speed(cli, 1.5)
+        await ctl.pause(cli)
+        await ctl.stop(cli)
+        await _stopped(ctl)
+        assert not ctl._session
+
+        # a new speed while slowing down cancels it and holds that speed
+        await ctl.set_speed(cli, 2.0)
+        await ctl.stop(cli)
+        await asyncio.sleep(0.03)
+        await ctl.set_speed(cli, 1.2)
+        await asyncio.sleep(0.2)
+        assert not ctl.stopping and ctl.speed == 1.2 and frames()[-1] == speed_frame(1.2)
+
+        # a fault cancels the slow-down: nothing more is written
+        await ctl.stop(cli)
+        await asyncio.sleep(0)
+        ctl._on_notify(MagicMock(), bytearray(b"\x03\x01\x07"))
+        n = len(frames())
+        await asyncio.sleep(0.2)
+        assert frames()[n:] == [] and ctl.speed == 0
 
         ctl.reset()
 

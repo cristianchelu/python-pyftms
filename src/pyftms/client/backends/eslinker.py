@@ -47,6 +47,9 @@ Observed on a YIJIAN 42AN (ESLinker F-9788, firmware 6.1.2):
 * In that mode the console no longer acts on its own buttons (remote included):
   it reports them as `05 01 n` and expects the client to apply them. This
   controller does, so a stop press still stops the belt.
+* Speed 0 stops the belt dead, like pulling the safety key. On its own the console
+  slows the belt down to the minimum speed first, so this controller does the same
+  for every stop and pause: it steps the speed down, then sends 0.
 """
 
 import asyncio
@@ -104,6 +107,15 @@ BUTTON_SPEED_STEP = 0.1
 
 KEEPALIVE_INTERVAL = 2.0
 """Seconds between keepalive frames. The console gives up after roughly 30 s."""
+
+RAMP_STEP = 0.2
+"""Speed decrease per step while slowing down for a stop. Units: `km/h`."""
+
+RAMP_INTERVAL = 0.25
+"""Seconds between slow-down steps (0.8 km/h per second)."""
+
+RAMP_DWELL = 1.0
+"""Seconds at the minimum speed before the belt stops."""
 
 
 def speed_frame(speed: float) -> bytes:
@@ -173,6 +185,9 @@ class ESLinkerController:
         min_speed: float = 0.8,
         max_speed: float = 12.0,
         keepalive: float = KEEPALIVE_INTERVAL,
+        ramp_step: float = RAMP_STEP,
+        ramp_interval: float = RAMP_INTERVAL,
+        ramp_dwell: float = RAMP_DWELL,
     ) -> None:
         """`on_data(**values)` receives every value this controller reports."""
         self._cb = callback
@@ -180,10 +195,15 @@ class ESLinkerController:
         self._min_speed = min_speed
         self._max_speed = max_speed
         self._keepalive = keepalive
+        self._ramp_step = ramp_step
+        self._ramp_interval = ramp_interval
+        self._ramp_dwell = ramp_dwell
         self._cli = None
         self._ready = False
         self._speed = 0.0
         self._task: asyncio.Task[None] | None = None
+        self._ramp: asyncio.Task[None] | None = None
+        self._ramp_end_session = True
         self._lock = asyncio.Lock()
 
         # Session counters, integrated from the commanded speed
@@ -229,11 +249,17 @@ class ESLinkerController:
         """Session time with the belt moving. Units: `s`."""
         return self._time
 
+    @property
+    def stopping(self) -> bool:
+        """`True` while the belt slows down for a stop or pause."""
+        return self._ramp is not None and not self._ramp.done()
+
     def reset(self) -> None:
         """Resetting state. Call while disconnection event."""
         if self._task:
             self._task.cancel()
 
+        self._cancel_ramp()
         self._task = None
         self._cli = None
         self._ready = False
@@ -251,6 +277,9 @@ class ESLinkerController:
         Sets target speed. Starts the belt if it is stopped, stops it with `0`.
         A stop ends the session unless `end_session` is `False` (pause).
 
+        A stop from above the minimum speed slows the belt down first and returns
+        while it does; any other speed set meanwhile cancels the slow-down.
+
         Units: `km/h`.
         """
         if speed > 0:
@@ -258,6 +287,31 @@ class ESLinkerController:
         else:
             speed = 0.0
 
+        if speed == 0 and (self.stopping or self._speed > self._min_speed):
+            if self.stopping:
+                # a stop while slowing down for a pause still ends the session
+                self._ramp_end_session = self._ramp_end_session or end_session
+            else:
+                self._ramp_end_session = end_session
+                self._ramp = asyncio.get_running_loop().create_task(
+                    self._slow_down(cli, source)
+                )
+
+            return ResultCode.SUCCESS
+
+        self._cancel_ramp()
+        await self._apply(cli, speed, source, end_session)
+
+        return ResultCode.SUCCESS
+
+    async def _apply(
+        self,
+        cli: BleakClient,
+        speed: float,
+        source: ControlSource,
+        end_session: bool = True,
+    ) -> None:
+        """Writes the speed and reports it."""
         async with self._lock:
             await self._ensure_ready(cli)
             await self._write(speed_frame(speed))
@@ -273,7 +327,25 @@ class ESLinkerController:
         )
         self._report(speed, previous, source)
 
-        return ResultCode.SUCCESS
+    async def _slow_down(self, cli: BleakClient, source: ControlSource) -> None:
+        """Steps the belt down to the minimum speed, waits, then stops it."""
+        try:
+            while self._speed > self._min_speed:
+                speed = round(max(self._speed - self._ramp_step, self._min_speed), 1)
+                await self._apply(cli, speed, source)
+                await asyncio.sleep(self._ramp_interval)
+
+            await asyncio.sleep(self._ramp_dwell)
+            await self._apply(cli, 0.0, source, self._ramp_end_session)
+
+        except Exception as exc:  # noqa: BLE001
+            _LOGGER.warning("ESLinker stop failed while slowing down: %s", exc)
+
+    def _cancel_ramp(self) -> None:
+        if self._ramp:
+            self._ramp.cancel()
+
+        self._ramp = None
 
     def _set_speed_state(self, speed: float, end_session: bool = True) -> float:
         """Account for the speed so far, apply the new one. Returns the previous."""
@@ -399,6 +471,7 @@ class ESLinkerController:
                 _LOGGER.warning(
                     "ESLinker fault E%02d: %s.", code, FAULTS.get(code, "unknown")
                 )
+                self._cancel_ramp()
                 previous = self._set_speed_state(0.0)
                 self._report(0.0, previous, "safety")
 
